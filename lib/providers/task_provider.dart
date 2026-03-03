@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
-import '../../../models/task_model.dart';
-import '../../../services/database_service.dart';
-import '../../../services/notification_service.dart';
+import '../models/task_model.dart';
+import '../services/database_service.dart';
+import '../services/notification_service.dart';
+import '../services/background_service.dart';
 
 class TaskProvider extends ChangeNotifier {
   final DatabaseService _db = DatabaseService();
@@ -73,28 +74,15 @@ class TaskProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> loadTasksByDate(DateTime date) async {
-    _isLoading = true;
-    notifyListeners();
-
-    try {
-      _tasks = await _db.getTasksByDate(date);
-    } catch (e) {
-      debugPrint('Error loading tasks by date: $e');
-    }
-
-    _isLoading = false;
-    notifyListeners();
+  Future<List<Task>> getTasksByDate(DateTime date) async {
+    return await _db.getTasksByDate(date);
   }
 
   Future<void> addTask(Task task) async {
     await _db.insertTask(task);
     await _notificationService.scheduleTaskNotification(task);
-
-    if (task.isMandatory) {
-      await _notificationService.scheduleMandatoryRecurring(task);
-    }
-
+    // Trigger background service to ensure alerts work with app closed
+    await BackgroundService.triggerImmediateCheck();
     await loadTasks();
   }
 
@@ -102,11 +90,9 @@ class TaskProvider extends ChangeNotifier {
     await _db.updateTask(task);
     await _notificationService.cancelTaskNotifications(task.id);
     await _notificationService.scheduleTaskNotification(task);
-
     if (task.isMandatory && !task.isCompleted) {
-      await _notificationService.scheduleMandatoryRecurring(task);
+      await BackgroundService.triggerImmediateCheck();
     }
-
     await loadTasks();
   }
 
@@ -120,8 +106,8 @@ class TaskProvider extends ChangeNotifier {
     );
 
     await _db.updateTask(task);
+    // Cancel ALL notifications when completed — stops the recurring alerts
     await _notificationService.cancelTaskNotifications(taskId);
-
     await loadTasks();
   }
 
@@ -129,31 +115,25 @@ class TaskProvider extends ChangeNotifier {
     final taskIndex = _tasks.indexWhere((t) => t.id == taskId);
     if (taskIndex == -1) return;
 
-    final task = _tasks[taskIndex].copyWith(
-      isCompleted: false,
-    );
-    // Reset completedAt
     final updatedTask = Task(
-      id: task.id,
-      title: task.title,
-      description: task.description,
-      scheduledTime: task.scheduledTime,
-      isMandatory: task.isMandatory,
+      id: _tasks[taskIndex].id,
+      title: _tasks[taskIndex].title,
+      description: _tasks[taskIndex].description,
+      scheduledTime: _tasks[taskIndex].scheduledTime,
+      isMandatory: _tasks[taskIndex].isMandatory,
       isCompleted: false,
-      createdAt: task.createdAt,
+      createdAt: _tasks[taskIndex].createdAt,
       completedAt: null,
-      snoozeCount: task.snoozeCount,
-      category: task.category,
-      priority: task.priority,
+      snoozeCount: _tasks[taskIndex].snoozeCount,
+      category: _tasks[taskIndex].category,
+      priority: _tasks[taskIndex].priority,
     );
 
     await _db.updateTask(updatedTask);
     await _notificationService.scheduleTaskNotification(updatedTask);
-
     if (updatedTask.isMandatory) {
-      await _notificationService.scheduleMandatoryRecurring(updatedTask);
+      await BackgroundService.triggerImmediateCheck();
     }
-
     await loadTasks();
   }
 
@@ -178,11 +158,7 @@ class TaskProvider extends ChangeNotifier {
     await _db.updateTask(snoozedTask);
     await _notificationService.cancelTaskNotifications(taskId);
     await _notificationService.scheduleTaskNotification(snoozedTask);
-
-    if (snoozedTask.isMandatory) {
-      await _notificationService.scheduleMandatoryRecurring(snoozedTask);
-    }
-
+    await BackgroundService.triggerImmediateCheck();
     await loadTasks();
   }
 
@@ -196,11 +172,47 @@ class TaskProvider extends ChangeNotifier {
     return await _db.getTasksForWeek(weekStart);
   }
 
+  // ═══════════════════════════════════════════════════════════════
+  //  COPY TASKS
+  // ═══════════════════════════════════════════════════════════════
+
+  /// Copy selected tasks to a target date. Returns count of copied tasks.
+  Future<int> copyTasksToDate(List<Task> tasks, DateTime targetDate) async {
+    final copiedTasks = await _db.copyTasksToDate(
+      tasks: tasks,
+      targetDate: targetDate,
+    );
+
+    // Schedule notifications for each copied task
+    for (final task in copiedTasks) {
+      await _notificationService.scheduleTaskNotification(task);
+    }
+
+    await BackgroundService.triggerImmediateCheck();
+    await loadTasks();
+    return copiedTasks.length;
+  }
+
+  /// Copy all tasks from one week to another. Returns count.
+  Future<int> copyWeekTasks(
+      DateTime sourceWeekStart, DateTime targetWeekStart) async {
+    final copiedTasks = await _db.copyWeekTasks(
+      sourceWeekStart: sourceWeekStart,
+      targetWeekStart: targetWeekStart,
+    );
+
+    for (final task in copiedTasks) {
+      await _notificationService.scheduleTaskNotification(task);
+    }
+
+    await BackgroundService.triggerImmediateCheck();
+    await loadTasks();
+    return copiedTasks.length;
+  }
+
   /// Check for pending mandatory tasks and reschedule alerts
   Future<void> checkMandatoryTasks() async {
     final pending = await _db.getPendingMandatoryTasks();
-    for (final task in pending) {
-      await _notificationService.scheduleMandatoryRecurring(task);
-    }
+    await _notificationService.recheckMandatoryTasks(pending);
   }
 }

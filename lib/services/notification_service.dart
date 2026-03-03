@@ -1,21 +1,73 @@
+import 'dart:isolate';
+import 'dart:typed_data';
+import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:timezone/timezone.dart' as tz;
-import 'package:timezone/data/latest_all.dart' as tz;
-import '../../../models/task_model.dart';
+import 'package:timezone/data/latest_all.dart' as tzdata;
+import 'package:flutter_timezone/flutter_timezone.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import '../models/task_model.dart';
 
 class NotificationService {
   static final NotificationService _instance = NotificationService._internal();
   factory NotificationService() => _instance;
   NotificationService._internal();
 
-  final FlutterLocalNotificationsPlugin _notifications =
+  static final FlutterLocalNotificationsPlugin _notifications =
       FlutterLocalNotificationsPlugin();
 
   static Function(String?)? onNotificationTap;
 
+  /// Initialize notifications + timezone — call from main() BEFORE runApp
   Future<void> initialize() async {
-    tz.initializeTimeZones();
+    // ── Timezone setup ──
+    tzdata.initializeTimeZones();
+    try {
+      final String tzName = await FlutterTimezone.getLocalTimezone();
+      tz.setLocalLocation(tz.getLocation(tzName));
+      debugPrint('[Notification] Timezone set to: $tzName');
+    } catch (e) {
+      tz.setLocalLocation(tz.getLocation('America/Sao_Paulo'));
+      debugPrint('[Notification] Timezone fallback to America/Sao_Paulo');
+    }
 
+    // ── Android channel: create high-priority channel BEFORE init ──
+    final androidPlugin = AndroidFlutterLocalNotificationsPlugin();
+
+    // Channel for normal tasks
+    await _notifications
+        .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin>()
+        ?.createNotificationChannel(
+          const AndroidNotificationChannel(
+            'task_alerts',
+            'Alertas de Tarefas',
+            description: 'Notificações de tarefas agendadas',
+            importance: Importance.high,
+            playSound: true,
+            enableVibration: true,
+            showBadge: true,
+          ),
+        );
+
+    // Channel for mandatory tasks — max priority, alarm-like
+    await _notifications
+        .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin>()
+        ?.createNotificationChannel(
+          const AndroidNotificationChannel(
+            'mandatory_alerts',
+            'Tarefas Obrigatórias',
+            description:
+                'Alertas persistentes que tocam até a tarefa ser concluída',
+            importance: Importance.max,
+            playSound: true,
+            enableVibration: true,
+            showBadge: true,
+          ),
+        );
+
+    // ── Initialize plugin ──
     const androidSettings =
         AndroidInitializationSettings('@mipmap/ic_launcher');
     const iosSettings = DarwinInitializationSettings(
@@ -24,69 +76,197 @@ class NotificationService {
       requestSoundPermission: true,
     );
 
-    const settings = InitializationSettings(
-      android: androidSettings,
-      iOS: iosSettings,
-    );
-
     await _notifications.initialize(
-      settings,
-      onDidReceiveNotificationResponse: (response) {
-        onNotificationTap?.call(response.payload);
-      },
+      const InitializationSettings(android: androidSettings, iOS: iosSettings),
+      onDidReceiveNotificationResponse: _onNotificationResponse,
+      onDidReceiveBackgroundNotificationResponse:
+          _onBackgroundNotificationResponse,
     );
 
-    // Request permissions
-    await _notifications
-        .resolvePlatformSpecificImplementation<
-            AndroidFlutterLocalNotificationsPlugin>()
-        ?.requestNotificationsPermission();
+    // ── Request permissions ──
+    await _requestPermissions();
   }
 
-  Future<void> scheduleTaskNotification(Task task) async {
-    final scheduledDate = tz.TZDateTime.from(task.scheduledTime, tz.local);
+  Future<void> _requestPermissions() async {
+    final androidPlugin = _notifications.resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>();
 
-    // Don't schedule if time has passed and task isn't mandatory
-    if (scheduledDate.isBefore(tz.TZDateTime.now(tz.local)) &&
-        !task.isMandatory) {
-      return;
+    if (androidPlugin != null) {
+      // Notification permission (Android 13+)
+      await androidPlugin.requestNotificationsPermission();
+      // Exact alarm permission (Android 14+)
+      await androidPlugin.requestExactAlarmsPermission();
     }
+  }
+
+  /// Handle notification tap in foreground
+  static void _onNotificationResponse(NotificationResponse response) {
+    debugPrint('[Notification] Tapped: ${response.payload}');
+    onNotificationTap?.call(response.payload);
+  }
+
+  /// Handle notification tap from background/terminated — must be top-level
+  @pragma('vm:entry-point')
+  static void _onBackgroundNotificationResponse(NotificationResponse response) {
+    debugPrint('[Notification] Background tap: ${response.payload}');
+    // Save to SharedPreferences for the app to read when it opens
+    SharedPreferences.getInstance().then((prefs) {
+      prefs.setString('pending_notification_payload', response.payload ?? '');
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  SCHEDULE NOTIFICATIONS
+  // ═══════════════════════════════════════════════════════════════
+
+  /// Schedule main notification for a task
+  Future<void> scheduleTaskNotification(Task task) async {
+    if (task.isCompleted) return;
+
+    final now = tz.TZDateTime.now(tz.local);
+    final scheduledDate = tz.TZDateTime.from(task.scheduledTime, tz.local);
+    final notificationId = _getNotificationId(task.id);
+
+    // Cancel any existing notification for this task first
+    await cancelTaskNotifications(task.id);
+
+    if (scheduledDate.isAfter(now)) {
+      // ── Future task: schedule at exact time ──
+      await _notifications.zonedSchedule(
+        notificationId,
+        task.isMandatory ? '🔴 ${task.title}' : '📋 ${task.title}',
+        task.isMandatory
+            ? '⚠️ OBRIGATÓRIA — ${task.description.isNotEmpty ? task.description : "Realize esta tarefa agora!"}'
+            : task.description.isNotEmpty
+                ? task.description
+                : 'Hora de realizar sua tarefa!',
+        scheduledDate,
+        _getNotificationDetails(task, isRecurring: false),
+        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+        uiLocalNotificationDateInterpretation:
+            UILocalNotificationDateInterpretation.absoluteTime,
+        payload: task.id,
+      );
+      debugPrint('[Notification] Scheduled "${task.title}" for $scheduledDate');
+
+      // For mandatory tasks, also schedule the +1h recurring alert
+      if (task.isMandatory) {
+        await _scheduleMandatoryFollowUp(task, scheduledDate);
+      }
+    } else if (task.isMandatory) {
+      // ── Overdue mandatory: show NOW + schedule next hour ──
+      await _showImmediateMandatory(task);
+      await _scheduleMandatoryFollowUp(task, now);
+    }
+  }
+
+  /// Show mandatory alert immediately (overdue task)
+  Future<void> _showImmediateMandatory(Task task) async {
+    final notificationId = _getNotificationId(task.id);
+
+    await _notifications.show(
+      notificationId,
+      '🔴 ATRASADA: ${task.title}',
+      '⚠️ TAREFA OBRIGATÓRIA! ${task.snoozeCount > 0 ? "Já adiada ${task.snoozeCount}x. " : ""}Conclua agora!',
+      _getNotificationDetails(task, isRecurring: true),
+      payload: task.id,
+    );
+    debugPrint('[Notification] Showing immediate alert for "${task.title}"');
+  }
+
+  /// Schedule the +1h, +2h, +3h follow-up alerts for mandatory tasks
+  Future<void> _scheduleMandatoryFollowUp(
+      Task task, tz.TZDateTime fromTime) async {
+    final now = tz.TZDateTime.now(tz.local);
+
+    // Schedule alerts for the next 12 hours (1h intervals)
+    for (int i = 1; i <= 12; i++) {
+      final alertTime = fromTime.add(Duration(hours: i));
+
+      // Only schedule future alerts
+      if (alertTime.isAfter(now)) {
+        final recurringId = _getRecurringId(task.id, i);
+
+        await _notifications.zonedSchedule(
+          recurringId,
+          '🔴 PENDENTE: ${task.title}',
+          '⚠️ Tarefa obrigatória não concluída! Adiada ${task.snoozeCount + i}x. Conclua AGORA!',
+          alertTime,
+          _getNotificationDetails(task, isRecurring: true),
+          androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+          uiLocalNotificationDateInterpretation:
+              UILocalNotificationDateInterpretation.absoluteTime,
+          payload: '${task.id}_mandatory_$i',
+        );
+        debugPrint('[Notification] Mandatory follow-up #$i at $alertTime');
+      }
+    }
+  }
+
+  /// Reschedule all mandatory tasks — called by WorkManager background task
+  Future<void> recheckMandatoryTasks(List<Task> pendingMandatory) async {
+    for (final task in pendingMandatory) {
+      if (!task.isCompleted && task.isMandatory) {
+        await scheduleTaskNotification(task);
+      }
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  NOTIFICATION DETAILS (Android channels, sound, vibration)
+  // ═══════════════════════════════════════════════════════════════
+
+  NotificationDetails _getNotificationDetails(Task task,
+      {required bool isRecurring}) {
+    final isMandatory = task.isMandatory;
 
     final androidDetails = AndroidNotificationDetails(
-      'task_channel',
-      'Tarefas',
-      channelDescription: 'Notificações de tarefas',
-      importance: task.isMandatory ? Importance.max : Importance.high,
-      priority: task.isMandatory ? Priority.max : Priority.high,
-      fullScreenIntent: task.isMandatory,
-      ongoing: task.isMandatory,
-      autoCancel: !task.isMandatory,
+      isMandatory ? 'mandatory_alerts' : 'task_alerts',
+      isMandatory ? 'Tarefas Obrigatórias' : 'Alertas de Tarefas',
+      channelDescription: isMandatory
+          ? 'Alertas persistentes que tocam até a tarefa ser concluída'
+          : 'Notificações de tarefas agendadas',
+      // Priority & importance
+      importance: isMandatory ? Importance.max : Importance.high,
+      priority: isMandatory ? Priority.max : Priority.high,
+      // Behavior
+      fullScreenIntent: isMandatory,
+      ongoing: isRecurring && isMandatory, // Can't dismiss mandatory recurring
+      autoCancel: !isMandatory,
+      // Sound & vibration
       playSound: true,
       enableVibration: true,
-      category: AndroidNotificationCategory.alarm,
+      vibrationPattern: isMandatory
+          ? Int64List.fromList([0, 500, 200, 500, 200, 500]) // Long vibration
+          : Int64List.fromList([0, 300, 100, 300]),
+      // Visual
+      category: isMandatory
+          ? AndroidNotificationCategory.alarm
+          : AndroidNotificationCategory.reminder,
       visibility: NotificationVisibility.public,
+      // LED
+      enableLights: true,
+      ledColor: isMandatory ? const Color(0xFFFF6B6B) : const Color(0xFF6C9EFF),
+      ledOnMs: 1000,
+      ledOffMs: 500,
+      // Big text style
       styleInformation: BigTextStyleInformation(
-        task.description.isNotEmpty
-            ? task.description
-            : (task.isMandatory
-                ? '⚠️ TAREFA OBRIGATÓRIA - Deve ser concluída!'
-                : 'Hora de realizar sua tarefa!'),
-        contentTitle: '📋 ${task.title}',
-        summaryText: task.isMandatory ? 'OBRIGATÓRIA' : task.category,
+        isRecurring
+            ? '⚠️ Esta tarefa OBRIGATÓRIA ainda não foi concluída! Alertando a cada hora até ser feita.'
+            : (task.description.isNotEmpty
+                ? task.description
+                : (isMandatory
+                    ? '⚠️ TAREFA OBRIGATÓRIA — Deve ser concluída!'
+                    : 'Hora de realizar sua tarefa!')),
+        contentTitle: isRecurring
+            ? '🔴 PENDENTE: ${task.title}'
+            : (isMandatory ? '🔴 ${task.title}' : '📋 ${task.title}'),
+        summaryText: isMandatory
+            ? (task.snoozeCount > 0
+                ? 'OBRIGATÓRIA — Adiada ${task.snoozeCount}x'
+                : 'OBRIGATÓRIA')
+            : task.category,
       ),
-      actions: <AndroidNotificationAction>[
-        const AndroidNotificationAction(
-          'complete',
-          '✅ Concluir',
-          showsUserInterface: true,
-        ),
-        if (task.isMandatory)
-          const AndroidNotificationAction(
-            'snooze',
-            '⏰ Adiar 1h',
-            showsUserInterface: true,
-          ),
-      ],
     );
 
     const iosDetails = DarwinNotificationDetails(
@@ -96,117 +276,37 @@ class NotificationService {
       interruptionLevel: InterruptionLevel.timeSensitive,
     );
 
-    final details = NotificationDetails(
-      android: androidDetails,
-      iOS: iosDetails,
-    );
-
-    final notificationId = task.id.hashCode.abs() % 2147483647;
-
-    if (scheduledDate.isAfter(tz.TZDateTime.now(tz.local))) {
-      await _notifications.zonedSchedule(
-        notificationId,
-        task.isMandatory ? '🔴 ${task.title}' : '📋 ${task.title}',
-        task.isMandatory
-            ? '⚠️ OBRIGATÓRIA: ${task.description.isNotEmpty ? task.description : "Realize esta tarefa agora!"}'
-            : task.description.isNotEmpty
-                ? task.description
-                : 'Hora de realizar sua tarefa!',
-        scheduledDate,
-        details,
-        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
-        payload: task.id,
-        uiLocalNotificationDateInterpretation:
-            UILocalNotificationDateInterpretation.absoluteTime,
-      );
-    } else if (task.isMandatory && !task.isCompleted) {
-      // Show immediately for overdue mandatory tasks
-      await _notifications.show(
-        notificationId,
-        '🔴 ATRASADA: ${task.title}',
-        '⚠️ TAREFA OBRIGATÓRIA PENDENTE! Conclua agora!',
-        details,
-        payload: task.id,
-      );
-    }
+    return NotificationDetails(android: androidDetails, iOS: iosDetails);
   }
 
-  /// Schedule recurring alert for mandatory task (every hour)
-  Future<void> scheduleMandatoryRecurring(Task task) async {
-    if (!task.isMandatory || task.isCompleted) return;
-
-    final nextAlert = tz.TZDateTime.from(
-      task.scheduledTime.add(Duration(hours: task.snoozeCount + 1)),
-      tz.local,
-    );
-
-    if (nextAlert.isBefore(tz.TZDateTime.now(tz.local))) {
-      // Schedule for next hour from now
-      final now = tz.TZDateTime.now(tz.local);
-      final nextHour = now.add(const Duration(hours: 1));
-      await _scheduleRecurringNotification(task, nextHour);
-    } else {
-      await _scheduleRecurringNotification(task, nextAlert);
-    }
-  }
-
-  Future<void> _scheduleRecurringNotification(
-      Task task, tz.TZDateTime time) async {
-    final androidDetails = AndroidNotificationDetails(
-      'mandatory_channel',
-      'Tarefas Obrigatórias',
-      channelDescription: 'Alertas persistentes para tarefas obrigatórias',
-      importance: Importance.max,
-      priority: Priority.max,
-      fullScreenIntent: true,
-      ongoing: true,
-      autoCancel: false,
-      playSound: true,
-      enableVibration: true,
-      category: AndroidNotificationCategory.alarm,
-      visibility: NotificationVisibility.public,
-      styleInformation: BigTextStyleInformation(
-        '⚠️ Esta tarefa ainda não foi concluída! Já foi adiada ${task.snoozeCount + 1}x.',
-        contentTitle: '🔴 PENDENTE: ${task.title}',
-        summaryText: 'OBRIGATÓRIA - Adiada ${task.snoozeCount + 1}x',
-      ),
-    );
-
-    const iosDetails = DarwinNotificationDetails(
-      presentAlert: true,
-      presentBadge: true,
-      presentSound: true,
-      interruptionLevel: InterruptionLevel.critical,
-    );
-
-    final details = NotificationDetails(
-      android: androidDetails,
-      iOS: iosDetails,
-    );
-
-    final recurringId = (task.id.hashCode.abs() + 10000) % 2147483647;
-
-    await _notifications.zonedSchedule(
-      recurringId,
-      '🔴 PENDENTE: ${task.title}',
-      '⚠️ Tarefa obrigatória! Adiada ${task.snoozeCount + 1}x. Conclua agora!',
-      time,
-      details,
-      androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
-      payload: '${task.id}_recurring',
-      uiLocalNotificationDateInterpretation:
-          UILocalNotificationDateInterpretation.absoluteTime,
-    );
-  }
+  // ═══════════════════════════════════════════════════════════════
+  //  CANCEL NOTIFICATIONS
+  // ═══════════════════════════════════════════════════════════════
 
   Future<void> cancelTaskNotifications(String taskId) async {
-    final notificationId = taskId.hashCode.abs() % 2147483647;
-    final recurringId = (taskId.hashCode.abs() + 10000) % 2147483647;
-    await _notifications.cancel(notificationId);
-    await _notifications.cancel(recurringId);
+    // Cancel main notification
+    await _notifications.cancel(_getNotificationId(taskId));
+
+    // Cancel all recurring follow-ups (up to 12)
+    for (int i = 1; i <= 12; i++) {
+      await _notifications.cancel(_getRecurringId(taskId, i));
+    }
+    debugPrint('[Notification] Cancelled all notifications for task $taskId');
   }
 
   Future<void> cancelAllNotifications() async {
     await _notifications.cancelAll();
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  HELPERS
+  // ═══════════════════════════════════════════════════════════════
+
+  int _getNotificationId(String taskId) {
+    return taskId.hashCode.abs() % 2147483647;
+  }
+
+  int _getRecurringId(String taskId, int index) {
+    return (taskId.hashCode.abs() + (index * 1000)) % 2147483647;
   }
 }

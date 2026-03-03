@@ -1,14 +1,15 @@
+import 'package:daily_tasks/add_task_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
-import '../../../providers/task_provider.dart';
-import '../../../utils/app_theme.dart';
-import '../../../widgets/task_card.dart';
-import '../../../widgets/stat_widgets.dart';
-import '../../../widgets/date_selector.dart';
-import '../add_task_screen.dart';
+import '../providers/task_provider.dart';
+import '../utils/app_theme.dart';
+import '../widgets/task_card.dart';
+import '../widgets/stat_widgets.dart';
+import '../widgets/date_selector.dart';
 import 'report_screen.dart';
+import 'copy_tasks_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -32,7 +33,6 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       context.read<TaskProvider>().loadTasks().then((_) {
         _fadeController.forward();
-        // Check for pending mandatory tasks
         context.read<TaskProvider>().checkMandatoryTasks();
       });
     });
@@ -107,15 +107,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                               ),
                               const SizedBox(height: 4),
                               Text(
-                                dateFormat
-                                    .format(taskProvider.selectedDate)
-                                    .replaceFirst(
-                                      dateFormat
-                                          .format(taskProvider.selectedDate)[0],
-                                      dateFormat
-                                          .format(taskProvider.selectedDate)[0]
-                                          .toUpperCase(),
-                                    ),
+                                _capitalizeFirst(dateFormat
+                                    .format(taskProvider.selectedDate)),
                                 style: const TextStyle(
                                   fontSize: 28,
                                   fontWeight: FontWeight.w700,
@@ -133,23 +126,45 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                               ),
                             ],
                           ),
-                          ProgressRing(
-                            progress: selectedTasks.isEmpty
-                                ? 0
-                                : completedTasks.length / selectedTasks.length,
-                            size: 64,
-                            strokeWidth: 6,
-                            color: AppColors.success,
-                            child: Text(
-                              selectedTasks.isEmpty
-                                  ? '0%'
-                                  : '${((completedTasks.length / selectedTasks.length) * 100).round()}%',
-                              style: const TextStyle(
-                                fontSize: 14,
-                                fontWeight: FontWeight.w700,
-                                color: AppColors.textPrimary,
+                          Row(
+                            children: [
+                              // Copy tasks button
+                              GestureDetector(
+                                onTap: () => _navigateToCopyTasks(context),
+                                child: Container(
+                                  padding: const EdgeInsets.all(10),
+                                  decoration: BoxDecoration(
+                                    color: AppColors.infoSoft,
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  child: const Icon(
+                                    Icons.copy_all_rounded,
+                                    color: AppColors.info,
+                                    size: 22,
+                                  ),
+                                ),
                               ),
-                            ),
+                              const SizedBox(width: 10),
+                              ProgressRing(
+                                progress: selectedTasks.isEmpty
+                                    ? 0
+                                    : completedTasks.length /
+                                        selectedTasks.length,
+                                size: 54,
+                                strokeWidth: 5,
+                                color: AppColors.success,
+                                child: Text(
+                                  selectedTasks.isEmpty
+                                      ? '0%'
+                                      : '${((completedTasks.length / selectedTasks.length) * 100).round()}%',
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w700,
+                                    color: AppColors.textPrimary,
+                                  ),
+                                ),
+                              ),
+                            ],
                           ),
                         ],
                       ),
@@ -285,7 +300,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                       children: [
                         Container(
                           padding: const EdgeInsets.all(24),
-                          decoration: BoxDecoration(
+                          decoration: const BoxDecoration(
                             color: AppColors.surfaceLight,
                             shape: BoxShape.circle,
                           ),
@@ -306,18 +321,18 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                         ),
                         const SizedBox(height: 8),
                         const Text(
-                          'Toque no + para adicionar uma tarefa',
+                          'Toque no + para adicionar ou copie de outro dia',
                           style: TextStyle(
                             fontSize: 13,
                             color: AppColors.textMuted,
                           ),
+                          textAlign: TextAlign.center,
                         ),
                       ],
                     ),
                   ),
                 )
               else ...[
-                // Pending tasks section
                 if (pendingTasks.isNotEmpty) ...[
                   SliverToBoxAdapter(
                     child: Padding(
@@ -353,8 +368,6 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                     ),
                   ),
                 ],
-
-                // Completed tasks section
                 if (completedTasks.isNotEmpty) ...[
                   SliverToBoxAdapter(
                     child: Padding(
@@ -419,7 +432,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
             mainAxisAlignment: MainAxisAlignment.spaceAround,
             children: [
               _buildNavItem(0, Icons.task_alt_rounded, 'Tarefas'),
-              const SizedBox(width: 56), // Space for FAB
+              const SizedBox(width: 56),
               _buildNavItem(1, Icons.analytics_rounded, 'Relatórios'),
             ],
           ),
@@ -464,6 +477,11 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         ),
       ),
     );
+  }
+
+  String _capitalizeFirst(String text) {
+    if (text.isEmpty) return text;
+    return text[0].toUpperCase() + text.substring(1);
   }
 
   String _getGreeting() {
@@ -521,5 +539,34 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         transitionDuration: const Duration(milliseconds: 400),
       ),
     );
+  }
+
+  void _navigateToCopyTasks(BuildContext context) {
+    HapticFeedback.mediumImpact();
+    Navigator.push(
+      context,
+      PageRouteBuilder(
+        pageBuilder: (_, __, ___) => CopyTasksScreen(
+          currentDate: context.read<TaskProvider>().selectedDate,
+        ),
+        transitionsBuilder: (_, animation, __, child) {
+          return SlideTransition(
+            position: Tween<Offset>(
+              begin: const Offset(1, 0),
+              end: Offset.zero,
+            ).animate(CurvedAnimation(
+              parent: animation,
+              curve: Curves.easeOutCubic,
+            )),
+            child: child,
+          );
+        },
+        transitionDuration: const Duration(milliseconds: 400),
+      ),
+    ).then((result) {
+      if (result == true) {
+        context.read<TaskProvider>().loadTasks();
+      }
+    });
   }
 }

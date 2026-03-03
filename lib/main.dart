@@ -2,21 +2,27 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/date_symbol_data_local.dart';
-import '../providers/task_provider.dart';
-import '../services/notification_service.dart';
-import '../screens/home_screen.dart';
-import '../utils/app_theme.dart';
+import 'providers/task_provider.dart';
+import 'services/notification_service.dart';
+import 'services/background_service.dart';
+import 'screens/home_screen.dart';
+import 'utils/app_theme.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Initialize locale
+  // 1. Initialize locale for pt-BR date formatting
   await initializeDateFormatting('pt_BR', null);
 
-  // Initialize notifications
+  // 2. Initialize notifications (includes timezone setup)
   await NotificationService().initialize();
 
-  // Set system UI overlay style
+  // 3. Initialize background service (WorkManager)
+  //    This ensures mandatory task alerts fire even with app closed
+  await BackgroundService.initialize();
+  await BackgroundService.registerPeriodicCheck();
+
+  // 4. Set system UI overlay style
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
     statusBarColor: Colors.transparent,
     statusBarIconBrightness: Brightness.light,
@@ -24,7 +30,7 @@ void main() async {
     systemNavigationBarIconBrightness: Brightness.light,
   ));
 
-  // Lock orientation
+  // 5. Lock orientation
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,
     DeviceOrientation.portraitDown,
@@ -82,16 +88,18 @@ class _SplashScreenState extends State<SplashScreen>
     _controller.forward();
 
     Future.delayed(const Duration(seconds: 2), () {
-      Navigator.pushReplacement(
-        context,
-        PageRouteBuilder(
-          pageBuilder: (_, __, ___) => const HomeScreen(),
-          transitionsBuilder: (_, animation, __, child) {
-            return FadeTransition(opacity: animation, child: child);
-          },
-          transitionDuration: const Duration(milliseconds: 500),
-        ),
-      );
+      if (mounted) {
+        Navigator.pushReplacement(
+          context,
+          PageRouteBuilder(
+            pageBuilder: (_, __, ___) => const HomeScreen(),
+            transitionsBuilder: (_, animation, __, child) {
+              return FadeTransition(opacity: animation, child: child);
+            },
+            transitionDuration: const Duration(milliseconds: 500),
+          ),
+        );
+      }
     });
   }
 

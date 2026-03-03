@@ -1,6 +1,6 @@
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
-import '../../models/task_model.dart';
+import '../models/task_model.dart';
 
 class DatabaseService {
   static Database? _database;
@@ -110,5 +110,85 @@ class DatabaseService {
       orderBy: 'scheduledTime ASC',
     );
     return maps.map((map) => Task.fromMap(map)).toList();
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  COPY TASKS
+  // ═══════════════════════════════════════════════════════════════
+
+  /// Copy specific tasks from one day to another
+  Future<List<Task>> copyTasksToDate({
+    required List<Task> tasks,
+    required DateTime targetDate,
+  }) async {
+    final copiedTasks = <Task>[];
+
+    for (final task in tasks) {
+      final newScheduledTime = DateTime(
+        targetDate.year,
+        targetDate.month,
+        targetDate.day,
+        task.scheduledTime.hour,
+        task.scheduledTime.minute,
+      );
+
+      final copiedTask = Task(
+        title: task.title,
+        description: task.description,
+        scheduledTime: newScheduledTime,
+        isMandatory: task.isMandatory,
+        isCompleted: false,
+        snoozeCount: 0,
+        category: task.category,
+        priority: task.priority,
+      );
+
+      await insertTask(copiedTask);
+      copiedTasks.add(copiedTask);
+    }
+
+    return copiedTasks;
+  }
+
+  /// Copy tasks from one week to the next week
+  Future<List<Task>> copyWeekTasks({
+    required DateTime sourceWeekStart,
+    required DateTime targetWeekStart,
+  }) async {
+    final sourceTasks = await getTasksForWeek(sourceWeekStart);
+    final copiedTasks = <Task>[];
+
+    for (final task in sourceTasks) {
+      // Calculate the day offset within the week
+      final dayOffset = task.scheduledTime.difference(
+        DateTime(sourceWeekStart.year, sourceWeekStart.month, sourceWeekStart.day),
+      ).inDays;
+
+      final targetDate = targetWeekStart.add(Duration(days: dayOffset));
+
+      final newScheduledTime = DateTime(
+        targetDate.year,
+        targetDate.month,
+        targetDate.day,
+        task.scheduledTime.hour,
+        task.scheduledTime.minute,
+      );
+
+      final copiedTask = Task(
+        title: task.title,
+        description: task.description,
+        scheduledTime: newScheduledTime,
+        isMandatory: task.isMandatory,
+        isCompleted: false,
+        snoozeCount: 0,
+        category: task.category,
+        priority: task.priority,
+      );
+
+      await insertTask(copiedTask);
+      copiedTasks.add(copiedTask);
+    }
+
+    return copiedTasks;
   }
 }

@@ -694,7 +694,7 @@ class _ReportScreenState extends State<ReportScreen> {
     }
 
     HapticFeedback.mediumImpact();
-    _reportService.sendWeeklyReportByEmail(_weekTasks, _weekStart, email);
+    _reportService.sendReportByEmail(_weekTasks, _weekStart, email);
 
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
